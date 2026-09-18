@@ -1,0 +1,15 @@
+torch>=2.3.1
+torchvision>=0.18.1
+transformers>=4.47.1,<5
+datasets>=2.20.0
+accelerate>=0.29.3
+numpy>=1.24
+pandas>=2.0
+Pillow>=10.0
+tqdm>=4.66
+safetensors>=0.4
+sentencepiece>=0.2
+protobuf>=4.25
+bitsandbytes>=0.43; platform_system != "Darwin"
+scikit-learn>=1.5
+scipy>=1.11
