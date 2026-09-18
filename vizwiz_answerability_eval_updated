@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Answerability-only VizWiz evaluation.
+
+Trains Mean-S and L2S targets from streaming training samples, then evaluates
+No Steering, Mean-S, L2S, and oracle P2S on unseen streaming validation data.
+"""
+
+import argparse
+import csv
+import json
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import average_precision_score
+
+from vizwiz_l2s_full_eval import (
+    DATASET_ID,
+    MODEL_ID,
+    STEERING_LAYER,
+    answerability_confidence,
+    build_base_prompt,
+    build_p2s_prompts,
+    get_device,
+    get_hidden_representation,
+    get_image,
+    load_model,
+    load_vizwiz_samples,
+    prepare_inputs,
+    set_seed,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="VizWiz answerability-only evaluation")
+    parser.add_argument(
+        "--train_samples", type=int, default=100,
+        help="Samples from train split; -1 consumes the complete split."
+    )
+    parser.add_argument(
+        "--eval_samples", type=int, default=100,
+        help="Samples from validation split; -1 consumes the complete split."
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--prediction_threshold", type=float, default=0.5,
+        help="Probability threshold for converting answerability scores to labels."
+    )
+    parser.add_argument("--l2s_epochs", type=int, default=100)
+    parser.add_argument("--l2s_lr", type=float, default=1e-4)
+    parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--output_dir", default="./vizwiz_answerability_results")
+    return parser.parse_args()
+
+
+def cosine_similarity(first, second):
+    first = first.float()
+    second = second.float()
+    denominator = first.norm() * second.norm() + 1e-12
+    return float(torch.dot(first, second).item() / denominator.item())
+
+
+class L2S(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=2048):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, inputs):
+        return self.network(inputs)
+
+
+def train_l2s(representations, p2s_vectors, device, epochs=100, lr=1e-4):
+    model = L2S(
+        input_dim=representations.shape[1],
+        output_dim=p2s_vectors.shape[1],
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    representations = representations.to(device)
+    p2s_vectors = p2s_vectors.to(device)
+    model.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        prediction = model(representations)
+        loss = criterion(prediction, p2s_vectors)
+        loss.backward()
+        optimizer.step()
+
+    return model
+
+
+def extract_p2s_and_context(model, processor, example, device):
+    image = get_image(example)
+    question = example["question"]
+    answerable = int(example["answerable"])
+    positive, negative = build_p2s_prompts(question, answerable)
+
+    positive_inputs = prepare_inputs(processor, image, positive, device)
+    negative_inputs = prepare_inputs(processor, image, negative, device)
+    positive_hidden = get_hidden_representation(
+        model, positive_inputs, STEERING_LAYER
+    ).squeeze(0).float().cpu()
+    negative_hidden = get_hidden_representation(
+        model, negative_inputs, STEERING_LAYER
+    ).squeeze(0).float().cpu()
+
+    context_inputs = prepare_inputs(
+        processor, image, build_base_prompt(question), device
+    )
+    context = get_hidden_representation(
+        model, context_inputs, STEERING_LAYER
+    ).squeeze(0).float().cpu()
+    return positive_hidden - negative_hidden, context
+
+
+def main(args):
+    set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = get_device()
+
+    train_samples = load_vizwiz_samples(
+        args.train_samples, args.seed, split="train"
+    )
+    validation_samples = load_vizwiz_samples(
+        args.eval_samples, args.seed + 1, split="validation"
+    )
+    if not train_samples or not validation_samples:
+        raise RuntimeError("Both train and validation samples are required.")
+
+    model, processor = load_model(args.model, device)
+
+    print("Extracting training P2S targets...")
+    train_vectors = []
+    train_contexts = []
+    for example in train_samples:
+        vector, context = extract_p2s_and_context(
+            model, processor, example, device
+        )
+        train_vectors.append(vector)
+        train_contexts.append(context)
+    train_vectors = torch.stack(train_vectors)
+    train_contexts = torch.stack(train_contexts)
+    mean_s = train_vectors.mean(dim=0)
+
+    print("Training L2S on training samples only...")
+    l2s_model = train_l2s(
+        train_contexts,
+        train_vectors,
+        device,
+        epochs=args.l2s_epochs,
+        lr=args.l2s_lr,
+    )
+
+    print("Extracting validation P2S targets...")
+    validation_vectors = []
+    validation_contexts = []
+    labels = []
+    for example in validation_samples:
+        vector, context = extract_p2s_and_context(
+            model, processor, example, device
+        )
+        validation_vectors.append(vector)
+        validation_contexts.append(context)
+        labels.append(int(example["answerable"]))
+    validation_vectors = torch.stack(validation_vectors)
+    validation_contexts = torch.stack(validation_contexts)
+
+    with torch.no_grad():
+        l2s_vectors = l2s_model(
+            validation_contexts.to(device)
+        ).float().cpu()
+
+    methods = {
+        "No Steering": None,
+        "Mean-S": mean_s,
+        "L2S": l2s_vectors,
+        "P2S": validation_vectors,
+    }
+    probabilities = {name: [] for name in methods}
+    perturbations = {name: [] for name in methods}
+    rows = []
+
+    print("Evaluating answerability for all methods...")
+    for index, example in enumerate(validation_samples):
+        image = get_image(example)
+        question = example["question"]
+        row = {
+            "index": index,
+            "id": example.get("id", str(index)),
+            "question": question,
+            "answerable": labels[index],
+        }
+        for name, vectors in methods.items():
+            vector = None if vectors is None else (
+                vectors if vectors.ndim == 1 else vectors[index]
+            )
+            probability, stats = answerability_confidence(
+                model,
+                processor,
+                image,
+                question,
+                device,
+                steering_vector=vector,
+                alpha=args.alpha,
+                steering_layer=STEERING_LAYER,
+                return_stats=True,
+            )
+            probabilities[name].append(probability)
+            perturbations[name].append(stats)
+            row[f"{name}_probability"] = probability
+            row[f"{name}_perturbation_l2"] = stats["max_l2"]
+        rows.append(row)
+
+    ap = {
+        name: float(average_precision_score(labels, scores))
+        for name, scores in probabilities.items()
+    }
+    accuracy = {
+        name: float(np.mean([
+            int(probability >= args.prediction_threshold) == label
+            for probability, label in zip(scores, labels)
+        ]))
+        for name, scores in probabilities.items()
+    }
+    mean_perturbation = {
+        name: float(np.mean([item["max_l2"] for item in stats]))
+        for name, stats in perturbations.items()
+    }
+    summary = {
+        "model": args.model,
+        "dataset": DATASET_ID,
+        "streaming": True,
+        "train_samples": len(train_samples),
+        "validation_samples": len(validation_samples),
+        "steering_layer": STEERING_LAYER,
+        "alpha": args.alpha,
+        "answerability_ap": ap,
+        "answerability_accuracy_at_threshold": accuracy,
+        "prediction_threshold": args.prediction_threshold,
+        "mean_hidden_state_perturbation_l2": mean_perturbation,
+        "mean_s_norm": float(mean_s.norm().item()),
+        "mean_validation_p2s_norm": float(validation_vectors.norm(dim=1).mean().item()),
+        "mean_cosine_l2s_p2s": float(np.mean([
+            cosine_similarity(l2s_vectors[i], validation_vectors[i])
+            for i in range(len(validation_vectors))
+        ])),
+    }
+
+    csv_path = os.path.join(args.output_dir, "answerability_per_sample.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    json_path = os.path.join(args.output_dir, "answerability_summary.json")
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+
+    txt_path = os.path.join(args.output_dir, "answerability_analysis.txt")
+    with open(txt_path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(summary, indent=2) + "\n\n")
+        handle.write(
+            "Prediction rule: predicted label = 1 when probability >= "
+            f"{args.prediction_threshold:.3f}; otherwise predicted label = 0.\n\n"
+        )
+        for row in rows:
+            handle.write("=" * 80 + "\n")
+            handle.write(
+                f"Question {row['index']}: {row['question']}\n"
+                f"Answerable: {row['answerable']}\n"
+            )
+            for name in methods:
+                probability = row[f"{name}_probability"]
+                predicted_label = int(
+                    probability >= args.prediction_threshold
+                )
+                handle.write(
+                    f"{name}: probability={probability:.6f}; "
+                    f"actual_label={row['answerable']}; "
+                    f"predicted_label={predicted_label}; "
+                    f"perturbation_l2={row[f'{name}_perturbation_l2']:.6f}\n"
+                )
+
+    print(json.dumps(summary, indent=2))
+    print(f"Saved {txt_path}, {json_path}, and {csv_path}")
+
+
+if __name__ == "__main__":
+    main(parse_args())
