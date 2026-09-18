@@ -1,0 +1,1 @@
+VizWiz dataset paper link:  https://arxiv.org/pdf/1802.08218
